@@ -8,6 +8,8 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/sha256"
+	"sync"
+	"unsafe"
 
 	"encoding/binary"
 	"fmt"
@@ -23,12 +25,13 @@ import (
 
 	cr "github.com/zistvan/crypto"
 	pb "github.com/zistvan/proto"
+	ucx "github.com/zistvan/ucxclient"
 )
 
 const (
-	PORT_CLIENT = 12340
-	PORT_PEER   = 12341
-	PORT_COORD  = 12342
+	PORT_OFFSET_CLIENT = 0
+	PORT_OFFSET_PEER   = 1
+	PORT_OFFSET_COORD  = 2
 )
 
 const (
@@ -82,12 +85,21 @@ type Node struct {
 	nodeCount    int
 	coordPresent bool
 	nodeAddr     []string
+	nodePort     []int
 	nodeRole     []int
 	nodeConn     []net.Conn
 	clientCount  int
 	deadClients  int
 	leaderId     int
 	coordId      int
+
+	//offloading
+	offload             bool
+	ucxClient           ucx.Ucx_client
+	offloadOutgoingSign bool
+	offloadOutgoingHash bool
+	offloadIncomingSign bool
+	offloadIncomingHash bool
 
 	//debugging
 	reconfigured bool
@@ -125,8 +137,7 @@ type Node struct {
 }
 
 // Initialize sets up a node and tells it about all other nodes in the network and their roles. Both consensus peers and clients are defined at startup time and put here. The node list must contain all clients at the end.
-func (p *Node) Initialize(myID int, nodeAddr []string, nodeRoles []int) {
-
+func (p *Node) Initialize(myID int, nodeAddr []string, nodePort []int, nodeRoles []int, offload bool) {
 	if os.Getenv("BFT_PK_CLI") == "true" {
 		p.usePKToClient = true
 	} else {
@@ -141,6 +152,9 @@ func (p *Node) Initialize(myID int, nodeAddr []string, nodeRoles []int) {
 
 	p.nodeRole = nodeRoles
 	p.nodeAddr = nodeAddr
+	p.nodePort = nodePort
+
+	p.offload = offload
 
 	p.clientCount = 0
 	p.peerCount = 0
@@ -224,6 +238,17 @@ func (p *Node) Initialize(myID int, nodeAddr []string, nodeRoles []int) {
 	}
 	p.lastCheckpointSeq = 0
 	p.cntPendingCheckpoint = 0
+
+	if p.offload {
+		p.ucxClient = ucx.NewUcx_client()
+		err := p.ucxClient.Init_conn("192.168.100.4", 40300)
+		// err := p.ucxClient.Init_conn("127.0.0.1", 40300)
+		if err != 0 {
+			fmt.Printf("Error creating DPU conn: %d\n", err)
+		}
+
+		fmt.Println("Connected to dpu")
+	}
 }
 
 // BringUp starts the node. If it is a client, it will connec to consensus peers and then return. If it is a peer, it will connect to others and wait for all clients to connect before returning.
@@ -232,18 +257,61 @@ func (p *Node) Run() {
 	p.nodeConn = make([]net.Conn, p.nodeCount)
 
 	if p.myRole == ROLE_CLIENT {
-		time.Sleep(time.Millisecond * 3000)
+		time.Sleep(time.Millisecond * 4000)
 		p.initConnectionsAsClient()
 		return
-
 	} else if p.myRole == ROLE_PEER_FOLLOWER || p.myRole == ROLE_PEER_LEADER {
-		go p.openAndListen(PORT_CLIENT)
-		go p.openAndListen(PORT_PEER)
-		go p.openAndListen(PORT_COORD)
 
-		time.Sleep(time.Millisecond * 2000)
+		if p.offload {
+			portArray := []int32{}
+			roleArray := []int32{}
+			for i := 0; i < p.nodeCount; i++ {
+				portArray = append(portArray, int32(p.nodePort[i]))
+				roleArray = append(roleArray, int32(p.nodeRole[i]))
+			}
 
-		go p.initConnectionsAsPeer()
+			p.offloadOutgoingSign = false
+
+			configMsg := &pb.ConfigMessage{
+				BasePort:           int32(p.nodePort[p.myID]),
+				NodeCount:          int32(p.nodeCount),
+				Roles:              roleArray,
+				Addresses:          p.nodeAddr,
+				BasePorts:          portArray,
+				OutgoingDoHash:     false,
+				OutgoingDoSign:     p.offloadOutgoingSign,
+				IncomingDoHash:     false,
+				IncomingVerifySign: false,
+			}
+
+			if p.usePKToClient {
+				configMsg.SigType = pb.SigType_PKSig
+			} else {
+				configMsg.SigType = pb.SigType_MAC
+			}
+
+			rawMsg, err := proto.Marshal(configMsg)
+			if err != nil {
+				fmt.Printf("%s\n", err)
+			}
+
+			time.Sleep(time.Millisecond * 1000)
+
+			go p.openAndListenOnDPU()
+			p.ucxClient.Send(string(rawMsg[:]), 0)
+
+			time.Sleep(time.Millisecond * 2000)
+
+			go p.initConnectionsAsPeer()
+		} else {
+			go p.openAndListen(p.nodePort[p.myID] + PORT_OFFSET_CLIENT)
+			go p.openAndListen(p.nodePort[p.myID] + PORT_OFFSET_PEER)
+			go p.openAndListen(p.nodePort[p.myID] + PORT_OFFSET_COORD)
+
+			time.Sleep(time.Millisecond * 3000)
+
+			go p.initConnectionsAsPeer()
+		}
 
 		waitingFor := p.peerCount + p.clientCount
 		if p.coordPresent {
@@ -259,9 +327,9 @@ func (p *Node) Run() {
 
 	} else if p.myRole == ROLE_COORDINATOR {
 
-		go p.openAndListen(PORT_COORD)
+		go p.openAndListen(p.nodePort[p.myID] + PORT_OFFSET_COORD)
 
-		time.Sleep(time.Millisecond * 2000)
+		time.Sleep(time.Millisecond * 3000)
 
 		go p.initConnectionsAsPeer()
 
@@ -280,14 +348,21 @@ func (p *Node) Run() {
 
 func (p *Node) initConnectionsAsClient() {
 
+	dialer := &net.Dialer{
+		LocalAddr: &net.TCPAddr{
+			IP:   net.ParseIP(p.nodeAddr[p.myID]),
+			Port: 0,
+		},
+	}
+
 	for ind := 0; ind < p.peerCount; ind++ {
 		//fmt.Println("Connecting to " + p.nodeAddr[ind] + ":" + strconv.Itoa(PORT_CLIENT))
-		conn, err := net.Dial("tcp", p.nodeAddr[ind]+":"+strconv.Itoa(PORT_CLIENT))
+		conn, err := dialer.Dial("tcp", p.nodeAddr[ind]+":"+strconv.Itoa(p.nodePort[ind]+PORT_OFFSET_CLIENT))
 		if err != nil {
 			fmt.Printf("%s\n", err)
 		} else {
 			p.nodeConn[ind] = conn
-			fmt.Println("Connected to " + p.nodeAddr[ind] + ":" + strconv.Itoa(PORT_CLIENT))
+			fmt.Println("Connected to " + p.nodeAddr[ind] + ":" + strconv.Itoa(p.nodePort[ind]+PORT_OFFSET_CLIENT))
 		}
 
 	}
@@ -297,7 +372,7 @@ func (p *Node) initConnectionsAsClient() {
 func (p *Node) openAndListen(port int) {
 
 	fmt.Println("Listening on " + p.nodeAddr[p.myID] + ":" + strconv.Itoa(port))
-	ln, err := net.Listen("tcp", ":"+strconv.Itoa(port))
+	ln, err := net.Listen("tcp", p.nodeAddr[p.myID]+":"+strconv.Itoa(port))
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(0)
@@ -309,7 +384,7 @@ func (p *Node) openAndListen(port int) {
 
 		chanToUse := p.chInData
 
-		if port == PORT_CLIENT {
+		if port == p.nodePort[p.myID]+PORT_OFFSET_CLIENT {
 			p.deadClients = 0
 			chanToUse = p.chClientInData
 
@@ -319,7 +394,7 @@ func (p *Node) openAndListen(port int) {
 					fmt.Println("Connection from ", i, " "+raddr)
 				}
 			}
-		} else if port == PORT_COORD {
+		} else if port == p.nodePort[p.myID]+PORT_OFFSET_COORD {
 			chanToUse = p.chCoordInData
 		}
 
@@ -328,6 +403,72 @@ func (p *Node) openAndListen(port int) {
 		p.chConEvent <- port
 
 	}
+}
+
+func (p *Node) openAndListenOnDPU() {
+	go func() {
+		for {
+			messageCount := p.ucxClient.GetPeerMessageCount()
+			if messageCount > 0 {
+				messageSizePtr := p.ucxClient.GetPeerMessageSizes(messageCount)
+				messageSizes := unsafe.Slice(messageSizePtr, messageCount)
+				peerMessages := unsafe.Slice(p.ucxClient.GetPeerMessages(messageCount), messageCount)
+				for i := 0; i < messageCount; i++ {
+					messageSlice := unsafe.Slice(peerMessages[i], messageSizes[i])
+
+					msg := &pb.PeerMessage{}
+					err := proto.Unmarshal(messageSlice, msg)
+					if err != nil {
+						fmt.Printf("Error marshalling peer message: %s\n", err)
+					} else {
+						p.chInData <- msg
+					}
+				}
+			}
+		}
+	}()
+
+	go func() {
+		for {
+			messageCount := p.ucxClient.GetClientMessageCount()
+			if messageCount > 0 {
+				messageSizes := unsafe.Slice(p.ucxClient.GetClientMessageSizes(messageCount), messageCount)
+				clientMessages := unsafe.Slice(p.ucxClient.GetClientMessages(messageCount), messageCount)
+				for i := 0; i < messageCount; i++ {
+					messageSlice := unsafe.Slice(clientMessages[i], messageSizes[i])
+
+					msg := &pb.PeerMessage{}
+					err := proto.Unmarshal(messageSlice, msg)
+					if err != nil {
+						fmt.Printf("Error marshalling client message: %s\n", err)
+					} else {
+						p.chClientInData <- msg
+					}
+				}
+			}
+		}
+	}()
+
+	go func() {
+		for {
+			messageCount := p.ucxClient.GetCoordMessageCount()
+			if messageCount > 0 {
+				messageSizes := unsafe.Slice(p.ucxClient.GetCoordMessageSizes(messageCount), messageCount)
+				coordMessages := unsafe.Slice(p.ucxClient.GetCoordMessages(messageCount), messageCount)
+				for i := 0; i < messageCount; i++ {
+					messageSlice := unsafe.Slice(coordMessages[i], messageSizes[i])
+
+					msg := &pb.PeerMessage{}
+					err := proto.Unmarshal(messageSlice, msg)
+					if err != nil {
+						fmt.Printf("Error marshalling coord message: %s\n", err)
+					} else {
+						p.chCoordInData <- msg
+					}
+				}
+			}
+		}
+	}()
 }
 
 // receiveOnConn is an infinite loop in which a valid protobuf is attempted to be read from the TCP connection. It is unmarshalled and passed to the channel. No further validation of the message contents takes place here.
@@ -387,32 +528,38 @@ func (p *Node) receiveOnConn(conn net.Conn, ch chan *pb.PeerMessage) {
 }
 
 func (p *Node) initConnectionsAsPeer() {
+	if p.offload {
+		p.ucxClient.Send("", 1)
 
-	for ind := 0; ind < p.nodeCount; ind++ {
-		portToConn := -1
-		if p.nodeRole[ind] == ROLE_PEER_FOLLOWER || p.nodeRole[ind] == ROLE_PEER_LEADER {
-			if p.myRole != ROLE_COORDINATOR {
-				portToConn = PORT_PEER
-			} else {
-				portToConn = PORT_COORD
-			}
-
-		} else if p.nodeRole[ind] == ROLE_COORDINATOR {
-			portToConn = PORT_COORD
+		for _, port := range p.nodePort {
+			p.chConEvent <- port
 		}
-		if portToConn != -1 {
-			conn, err := net.Dial("tcp", p.nodeAddr[ind]+":"+strconv.Itoa(portToConn))
-			if err == nil {
-				p.nodeConn[ind] = conn
-				fmt.Println("Connected to peer ", ind, " "+p.nodeAddr[ind]+":"+strconv.Itoa(portToConn))
-			} else {
-				fmt.Print("Error at node " + strconv.Itoa(p.myID) + ": ")
-				fmt.Println(err)
-				os.Exit(0)
+	} else {
+		for ind := 0; ind < p.nodeCount; ind++ {
+			portToConn := -1
+			if p.nodeRole[ind] == ROLE_PEER_FOLLOWER || p.nodeRole[ind] == ROLE_PEER_LEADER {
+				if p.myRole != ROLE_COORDINATOR {
+					portToConn = p.nodePort[ind] + PORT_OFFSET_PEER
+				} else {
+					portToConn = p.nodePort[ind] + PORT_OFFSET_COORD
+				}
+
+			} else if p.nodeRole[ind] == ROLE_COORDINATOR {
+				portToConn = p.nodePort[ind] + PORT_OFFSET_COORD
+			}
+			if portToConn != -1 {
+				conn, err := net.Dial("tcp", p.nodeAddr[ind]+":"+strconv.Itoa(portToConn))
+				if err == nil {
+					p.nodeConn[ind] = conn
+					fmt.Println("Connected to peer ", ind, " "+p.nodeAddr[ind]+":"+strconv.Itoa(portToConn))
+				} else {
+					fmt.Print("Error at node " + strconv.Itoa(p.myID) + ": ")
+					fmt.Println(err)
+					os.Exit(0)
+				}
 			}
 		}
 	}
-
 }
 
 // ClientSendToLeader is used to send a message from a client node to the leader node. It computes signatures, etc. inside. It does not wait for an answer and returns once the data is sent.
@@ -538,12 +685,12 @@ func (p *Node) ClientReceiveFromPeers(msgId chan int) {
 	}
 }
 
-/*RunPeerLoop executes the peer pipeline in an infinite loop. It has the following stages:
+/*
+RunPeerLoop executes the peer pipeline in an infinite loop. It has the following stages:
 - parallel receive, one thread per peer, feeding into a single channel from all other peers (chInData) and a single channel for all clients (chClientData)
 - parallel verifier step takes maeesages from a channel and does a FIFO round-robin parallelization -- there's two instances, one for peers and one for clients. Both put verified messages into 'verifOut'.
 - decision step -- single thread, defines what happens to each message
 - parallel sender step -- sends a given message in parallel to different recipients. This means also computing signatures in parallel.
-
 */
 func (p *Node) RunPeerLoop() {
 
@@ -605,7 +752,6 @@ func (p Node) peerVerifierStep(chIn chan *pb.PeerMessage, chOut chan *pb.PeerMes
 
 // peerParallelVerifierStep distributes messages from the input channel in a round-robin fashion to several parallel verifiers. Results are collected the same way into a single channel.
 func (p *Node) peerParallelVerifierStep(chIn chan *pb.PeerMessage, chOut chan *pb.PeerMessage) {
-
 	verifChanIn := make([]chan *pb.PeerMessage, MAX_SIG_VERIF_CLIENT)
 	verifChanOut := make([]chan *pb.PeerMessage, MAX_SIG_VERIF_CLIENT)
 	for x := 0; x < MAX_SIG_VERIF_CLIENT; x++ {
@@ -710,7 +856,7 @@ func (p *Node) peerDecisionStep(chPeerIn chan *pb.PeerMessage, chClientIn chan *
 
 				}
 			} else {
-				fmt.Printf("I am no the ledaer. MyId is %d, and the leader is %d\n", p.myID, p.leaderId)
+				fmt.Printf("I am not the leader. MyId is %d, and the leader is %d\n", p.myID, p.leaderId)
 
 				msgR := &pb.PeerMessage{}
 				msgR.Type = pb.MsgType_ClientResponse
@@ -1370,18 +1516,118 @@ func (p *Node) peerParallelSenderStep(chIn chan *MessageWrapper) {
 		sendCnt := 0
 		hashCnt := 0
 		for {
-			wrap := <-hashOutQueues[hashCnt%MAX_SIG_CREATE]
-			hashCnt++
+			if p.offload {
+				sendBuf := make([]byte, 0)
+				pendingBytes := 0
+				wrap := &MessageWrapper{}
+				nextMsg := &MessageWrapper{}
+				nextMsg = nil
 
-			for _, elem := range wrap.sendTo {
+				for {
 
-				newWrap := &MessageWrapper{}
-				newWrap.msg = p.clonePeerMessageNoAuth(wrap.msg)
-				newWrap.sendTo = make([]int, 1)
-				newWrap.hash = wrap.hash
-				newWrap.sendTo[0] = elem
-				signQueues[sendCnt%MAX_SIG_CREATE] <- newWrap
-				sendCnt++
+					if nextMsg != nil {
+						wrap = nextMsg
+						nextMsg = nil
+					} else {
+						wrap = <-hashOutQueues[hashCnt%MAX_SIG_CREATE]
+						hashCnt++
+					}
+
+					nodeIds := make([]int32, 0)
+					for _, elem := range wrap.sendTo {
+						nodeIds = append(nodeIds, int32(elem))
+					}
+
+					signs := make([]*pb.Authenticator, 0)
+
+					if !p.offloadOutgoingSign {
+						signs = make([]*pb.Authenticator, len(nodeIds)*2)
+
+						var wg sync.WaitGroup
+						wg.Add(len(nodeIds))
+
+						for index, elem := range nodeIds {
+							go func(index int, elem int32) {
+								hash := wrap.hash
+
+								////s := time.Now()
+								auth := &pb.Authenticator{}
+								if p.nodeRole[int(elem)] == ROLE_CLIENT && p.usePKToClient == true {
+									auth = p.CreateSigForHash(hash, pb.SigType_PKSig, int(elem))
+								} else {
+									auth = p.CreateSigForHash(hash, pb.SigType_MAC, int(elem))
+								}
+
+								//extra sig for the coordinator
+								authCoord := &pb.Authenticator{}
+								if p.coordPresent {
+									authCoord = p.CreateSigForHash(hash, pb.SigType_MAC, p.coordId)
+								}
+
+								//fmt.Println("OutSign ", time.Since(s))
+								////s = time.Now()
+								signs[index*2] = auth
+								signs[index*2+1] = authCoord
+
+								wg.Done()
+							}(index, elem)
+						}
+
+						wg.Wait()
+					}
+
+					wrap.msg.Auth = nil
+
+					sendMsg := &pb.SendMessage{
+						NodeId:  nodeIds,
+						Message: wrap.msg,
+						Hash:    wrap.hash[:],
+						Signs:   signs,
+					}
+
+					rawMsg, err := proto.Marshal(sendMsg)
+					if err != nil {
+						fmt.Printf("%s\n", err)
+					}
+
+					lba := make([]byte, 4)
+					binary.LittleEndian.PutUint32(lba, uint32(len(rawMsg)))
+
+					sendBuf = append(sendBuf, lba...)
+					sendBuf = append(sendBuf, rawMsg...)
+					pendingBytes += len(lba) + len(rawMsg)
+
+					select {
+					case nextMsg = <-hashOutQueues[hashCnt%MAX_SIG_CREATE]:
+						hashCnt++
+						// will do an other pass
+						if pendingBytes < 64000 {
+							continue
+						}
+					default:
+						nextMsg = nil
+					}
+
+					p.ucxClient.Send(string(sendBuf[:]), 2)
+
+					sendBuf = make([]byte, 0)
+					pendingBytes = 0
+					sendCnt++
+				}
+			} else {
+				wrap := <-hashOutQueues[hashCnt%MAX_SIG_CREATE]
+				hashCnt++
+
+				for _, elem := range wrap.sendTo {
+
+					newWrap := &MessageWrapper{}
+					newWrap.msg = p.clonePeerMessageNoAuth(wrap.msg)
+					newWrap.sendTo = make([]int, 1)
+					newWrap.hash = wrap.hash
+					newWrap.sendTo[0] = elem
+					signQueues[sendCnt%MAX_SIG_CREATE] <- newWrap
+					sendCnt++
+				}
 			}
 		}
 	}()
@@ -1436,7 +1682,7 @@ func (p *Node) CreateSigForHash(hash [32]byte, sigType pb.SigType, toNodeId int)
 
 }
 
-//VerifySig Verify the validity of a received message
+// VerifySig Verify the validity of a received message
 func (p *Node) VerifySig(pm *pb.PeerMessage) bool {
 
 	if pm.Auth == nil {

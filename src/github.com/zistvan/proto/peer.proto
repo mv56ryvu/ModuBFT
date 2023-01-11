@@ -19,30 +19,62 @@ enum MsgType {
     SyncState = 9;  
 }
 
+enum ReceivedChannel {
+  Client = 0;
+  Peer = 1;
+  Coord = 2;
+}
+
 message PeerMessage {
-    int32 fromNodeId = 1;
-    int32 msgId = 2;
-    int32 epochId = 3;
-    MsgType type = 4;
-    bytes attachedData = 5;
-    repeated Authenticator auth = 6;
-  }
+  int32 fromNodeId = 1;
+  int32 msgId = 2;
+  int32 epochId = 3;
+  MsgType type = 4;
+  bytes attachedData = 5;
+  repeated Authenticator auth = 6;
+}
 
-  message CertificateMessage {
-    bool initialized = 1;
-    int32 cntPrepared = 2;
-    repeated PeerMessage certificates = 3;
-  }
+message CertificateMessage {
+  bool initialized = 1;
+  int32 cntPrepared = 2;
+  repeated PeerMessage certificates = 3;
+}
 
-  message PayloadNewConfig {
-    repeated int32 members = 1;
-    int32 leader = 2;
-    bytes digestState = 3;
-    bytes digestP = 4;
-  }
+message PayloadNewConfig {
+  repeated int32 members = 1;
+  int32 leader = 2;
+  bytes digestState = 3;
+  bytes digestP = 4;
+}
 
-  message PayloadSyncState {
-    repeated int32 clients = 1;
-    CertificateMessage certificate = 2;
-    PeerMessage newConfigMessage = 3;
-  }
+message PayloadSyncState {
+  repeated int32 clients = 1;
+  CertificateMessage certificate = 2;
+  PeerMessage newConfigMessage = 3;
+}
+
+message ConfigMessage {
+  int32 basePort = 1;
+  int32 nodeCount = 2;
+  repeated int32 roles = 3;
+  repeated string addresses = 4;
+  repeated int32 basePorts = 5;
+  bool outgoingDoHash = 6;
+  bool outgoingDoSign = 7;
+  bool incomingDoHash = 8;
+  bool incomingVerifySign = 9;
+  string hashAlg = 10;
+  SigType sigType = 11;
+}
+
+message SendMessage {
+  repeated int32 nodeId = 1;
+  PeerMessage message = 2;
+  bytes hash = 3;
+  repeated Authenticator signs = 4;
+}
+
+message ReceivedMessage {
+  ReceivedChannel channel = 1;
+  bytes message = 2;
+}

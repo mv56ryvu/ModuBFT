@@ -1,11 +1,12 @@
 n=$1 #32
 machines=$2 #"10.10.5.31,10.10.5.32,10.10.5.33,10.10.5.34,10.10.5.35,10.10.5.36,10.10.5.37,10.10.5.38,10.10.5.39,10.10.5.40,10.10.5.41,10.10.5.42,10.10.5.61,10.10.5.62,10.10.5.63,10.10.5.64,10.10.5.65,10.10.5.66,10.10.5.67,10.10.5.68,10.10.5.69,10.10.5.70,10.10.5.71,10.10.5.72,10.10.5.201,10.10.5.202,10.10.5.203,10.10.5.204,10.10.5.205,10.10.5.206,10.10.5.207,10.10.5.208"
+ports=$3
 
-size=$3
-num_peer=$4
-num_client=$5
-async_factor=$6
-pk_to_client=$7
+size=$4
+num_peer=$5
+num_client=$6
+async_factor=$7
+pk_to_client=$8
 
 
 total_nodes=$((num_peer+num_client))
@@ -23,15 +24,19 @@ do
 done
 
 ip_list=`echo $machines | cut -d ',' -f1`
+port_list=`echo $ports | cut -d ',' -f1`
 
 for id in `seq 2 $total_nodes` 
 do
 	nth=`echo $machines | cut -d ',' -f$id`
 	ip_list="$ip_list,$nth"
+	nth=`echo $ports | cut -d ',' -f$id`
+	port_list="$port_list,$nth"
 done
 
 echo "NODES: $ip_list"
 echo "ROLES: $role_list"
+echo "PORTS: $port_list"
 
 echo -n "COPY: "
 for x in `seq 1 $total_nodes`
@@ -50,18 +55,18 @@ for x in `seq 1 $num_peer`
 do
 	host=`echo $machines | cut -d ',' -f$x`
     nodeId=$((x-1))    
-    (ssh $host "BFT_PK_CLI=$pk_to_client /tmp/cli-time $nodeId $ip_list $role_list $size" | grep "Through" | awk '{print $3}' > /tmp/$host.log &)
+    (ssh $host "BFT_PK_CLI=$pk_to_client /tmp/cli-time $nodeId $ip_list $port_list $role_list $size" | grep "Through" | awk '{print $3}' > /tmp/$host.log &)
 done
 
 for x in `seq $nextclient $total_nodes`
 do
 	host=`echo $machines | cut -d ',' -f$x`
     nodeId=$((x-1))    
-    (ssh $host "/tmp/cli-time $nodeId $ip_list $role_list $size $async_factor" | grep "Through" | awk '{print $3}' > /tmp/$host.log &)
+    (ssh $host "/tmp/cli-time $nodeId $ip_list $port_list $role_list $size $async_factor" | grep "Through" | awk '{print $3}' > /tmp/$host.log &)
 done
 
 host=`echo $machines | cut -d ',' -f$specclient`
-ssh $host "/tmp/cli-time-lat $num_peer $ip_list $role_list $size 1" | grep "Through" | awk '{print $3}' > /tmp/$host.log 
+ssh $host "/tmp/cli-time-lat $num_peer $ip_list $port_list $role_list $size 1" | grep "Through" | awk '{print $3}' > /tmp/$host.log 
 
 sleep 1
 

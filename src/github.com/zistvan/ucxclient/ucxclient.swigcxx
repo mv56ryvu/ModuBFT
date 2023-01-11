@@ -1,0 +1,9 @@
+%module ucxclient
+%include "std_string.i"
+%include <carrays.i>
+
+%{
+#include "ucxclient.h"
+%}
+
+%include "ucxclient.h"

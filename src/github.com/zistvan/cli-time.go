@@ -20,16 +20,20 @@ func main() {
 	It takes the following arguments:
 	1 - nodeID, start nodes from zero
 	2 - list of nodes defined by IP addresses, seprarated by comma. The list is the same for all. The location in the list == nodeID
-	3 - role of each node, separeted by comma. ROLE constants defined in Node.
-	4 - length of client requests in Bytes. This is only needed when starting a client
-	5 - optional batch factor (64)
-	6 - optional runtime (default 10s)
-	7 - optional print tput reading live (default 0)
+	3 - list of base ports of nodes, seprarated by comma. The list is the same for all. The location in the list == nodeID
+	4 - role of each node, separeted by comma. ROLE constants defined in Node.
+	5 - wether the node should offload functionality to a connected dpu
+	5 - length of client requests in Bytes. This is only needed when starting a client
+	6 - optional batch factor (64)
+	7 - optional runtime (default 10s)
+	8 - optional print tput reading live (default 0)
 	*/
 
 	myId, _ := strconv.Atoi(os.Args[1])
 	nodeList := strings.Split(os.Args[2], ",")
-	nodeRoleS := strings.Split(os.Args[3], ",")
+	portList := strings.Split(os.Args[3], ",")
+	nodeRoleS := strings.Split(os.Args[4], ",")
+	offload, _ := strconv.ParseBool(os.Args[5])
 	nodeRole := make([]int, len(nodeRoleS))
 	for ind, elem := range nodeRoleS {
 		nodeRole[ind], _ = strconv.Atoi(elem)
@@ -39,21 +43,31 @@ func main() {
 	runTime := 10
 	showLiveTput := 0
 
-	if len(os.Args) > 5 {
-		batchF, _ = strconv.Atoi(os.Args[5])
-	}
-
-	if len(os.Args) > 6 {
-		runTime, _ = strconv.Atoi(os.Args[6])
-	}
-
 	if len(os.Args) > 7 {
-		showLiveTput, _ = strconv.Atoi(os.Args[7])
+		batchF, _ = strconv.Atoi(os.Args[7])
+	}
+
+	if len(os.Args) > 8 {
+		runTime, _ = strconv.Atoi(os.Args[8])
+	}
+
+	if len(os.Args) > 9 {
+		showLiveTput, _ = strconv.Atoi(os.Args[9])
+	}
+
+	portListNumbers := make([]int, len(portList))
+	for i, portString := range portList {
+		port, err := strconv.Atoi(portString)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		portListNumbers[i] = port
 	}
 
 	me := &n.Node{}
 
-	me.Initialize(myId, nodeList, nodeRole)
+	me.Initialize(myId, nodeList, portListNumbers, nodeRole, offload)
 	me.Run()
 
 	// if the node is to be a client...
@@ -62,7 +76,7 @@ func main() {
 		time.Sleep(time.Millisecond * 2000)
 
 		//create a random value of specified length
-		vallen, _ := strconv.Atoi(os.Args[4])
+		vallen, _ := strconv.Atoi(os.Args[6])
 		rtxt := make([]byte, vallen)
 		if _, err := io.ReadFull(rand.Reader, rtxt); err != nil {
 			fmt.Println(err)
