@@ -69,9 +69,9 @@ message ConfigMessage {
 
 message SendMessage {
   repeated int32 nodeId = 1;
-  PeerMessage message = 2;
+  bytes message = 2;
   bytes hash = 3;
-  repeated Authenticator signs = 4;
+  repeated bytes signs = 4;
 }
 
 message ReceivedMessage {

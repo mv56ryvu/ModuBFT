@@ -8,7 +8,6 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/sha256"
-	"sync"
 	"unsafe"
 
 	"encoding/binary"
@@ -60,6 +59,7 @@ type MessageWrapper struct {
 	msg    *pb.PeerMessage
 	sendTo []int
 	hash   [32]byte
+	signs  []*pb.Authenticator
 }
 
 type PeerState struct {
@@ -101,13 +101,17 @@ type Node struct {
 	offloadIncomingSign bool
 	offloadIncomingHash bool
 
+	byteSent uint64
+
 	//debugging
 	reconfigured bool
 
-	cntPrepare   []int
-	cntCommit    []int
-	senderOf     []int
-	lastPrepared int
+	cntPrepare         []int
+	cntCommit          []int
+	senderOf           []int
+	lastPrepared       int
+	cntMessageSent     []int
+	cntMessageReceived []int
 
 	myRole      int
 	myEpoch     int
@@ -156,6 +160,8 @@ func (p *Node) Initialize(myID int, nodeAddr []string, nodePort []int, nodeRoles
 
 	p.offload = offload
 
+	p.byteSent = 0
+
 	p.clientCount = 0
 	p.peerCount = 0
 
@@ -175,7 +181,7 @@ func (p *Node) Initialize(myID int, nodeAddr []string, nodePort []int, nodeRoles
 		}
 	}
 
-	p.f = (p.peerCount - 1) / 2
+	p.f = (p.peerCount - 1) / 3
 
 	p.nodeConn = make([]net.Conn, p.peerCount)
 
@@ -213,6 +219,9 @@ func (p *Node) Initialize(myID int, nodeAddr []string, nodePort []int, nodeRoles
 		p.MACNonce[i] = nonce
 	}
 
+	p.cntMessageSent = make([]int, nodeCount)
+	p.cntMessageReceived = make([]int, nodeCount)
+
 	p.chInData = make(chan *pb.PeerMessage, 1000)
 	p.chClientInData = make(chan *pb.PeerMessage, 1000)
 	p.chCoordInData = make(chan *pb.PeerMessage, 1000)
@@ -232,9 +241,9 @@ func (p *Node) Initialize(myID int, nodeAddr []string, nodePort []int, nodeRoles
 	p.clientMsgDigests = make([][]byte, LOG_SIZE)
 
 	p.commitLog = make([]pb.PeerMessage, LOG_SIZE)
-	p.checkpointMsgs[1] = make([]pb.PeerMessage, 2*p.f+1)
+	p.checkpointMsgs[1] = make([]pb.PeerMessage, 3*p.f+1)
 	for x := 0; x < CIRCULAR_BUFFER_SIZE; x++ {
-		p.preparedLog[x] = make([]pb.PeerMessage, 2*p.f+1)
+		p.preparedLog[x] = make([]pb.PeerMessage, 3*p.f+1)
 	}
 	p.lastCheckpointSeq = 0
 	p.cntPendingCheckpoint = 0
@@ -257,7 +266,7 @@ func (p *Node) Run() {
 	p.nodeConn = make([]net.Conn, p.nodeCount)
 
 	if p.myRole == ROLE_CLIENT {
-		time.Sleep(time.Millisecond * 4000)
+		time.Sleep(time.Millisecond * 7000)
 		p.initConnectionsAsClient()
 		return
 	} else if p.myRole == ROLE_PEER_FOLLOWER || p.myRole == ROLE_PEER_LEADER {
@@ -298,9 +307,10 @@ func (p *Node) Run() {
 			time.Sleep(time.Millisecond * 1000)
 
 			go p.openAndListenOnDPU()
+			fmt.Println("Startet send of configMsg, ", len(rawMsg), " Bytes")
 			p.ucxClient.Send(string(rawMsg[:]), 0)
 
-			time.Sleep(time.Millisecond * 2000)
+			time.Sleep(time.Millisecond * 5000)
 
 			go p.initConnectionsAsPeer()
 		} else {
@@ -308,7 +318,7 @@ func (p *Node) Run() {
 			go p.openAndListen(p.nodePort[p.myID] + PORT_OFFSET_PEER)
 			go p.openAndListen(p.nodePort[p.myID] + PORT_OFFSET_COORD)
 
-			time.Sleep(time.Millisecond * 3000)
+			time.Sleep(time.Millisecond * 6000)
 
 			go p.initConnectionsAsPeer()
 		}
@@ -329,7 +339,7 @@ func (p *Node) Run() {
 
 		go p.openAndListen(p.nodePort[p.myID] + PORT_OFFSET_COORD)
 
-		time.Sleep(time.Millisecond * 3000)
+		time.Sleep(time.Millisecond * 6000)
 
 		go p.initConnectionsAsPeer()
 
@@ -422,8 +432,21 @@ func (p *Node) openAndListenOnDPU() {
 						fmt.Printf("Error marshalling peer message: %s\n", err)
 					} else {
 						p.chInData <- msg
+						p.cntMessageReceived[msg.FromNodeId]++
 					}
 				}
+			} else if messageCount == -1 {
+				totalMessageReceived := 0
+				totalMessageSent := 0
+				for i := 0; i < p.nodeCount; i++ {
+					totalMessageReceived += p.cntMessageReceived[i]
+					totalMessageSent += p.cntMessageSent[i]
+				}
+				fmt.Println("Messages received/s: ", totalMessageReceived/10)
+				fmt.Println("Messages sent/s: ", totalMessageSent/10)
+				os.Exit(0)
+			} else {
+				time.Sleep(time.Millisecond * 1)
 			}
 		}
 	}()
@@ -443,32 +466,44 @@ func (p *Node) openAndListenOnDPU() {
 						fmt.Printf("Error marshalling client message: %s\n", err)
 					} else {
 						p.chClientInData <- msg
+						p.cntMessageReceived[msg.FromNodeId]++
 					}
 				}
+			} else if messageCount == -1 {
+				break
+			} else {
+				time.Sleep(time.Millisecond * 1)
 			}
 		}
 	}()
 
-	go func() {
-		for {
-			messageCount := p.ucxClient.GetCoordMessageCount()
-			if messageCount > 0 {
-				messageSizes := unsafe.Slice(p.ucxClient.GetCoordMessageSizes(messageCount), messageCount)
-				coordMessages := unsafe.Slice(p.ucxClient.GetCoordMessages(messageCount), messageCount)
-				for i := 0; i < messageCount; i++ {
-					messageSlice := unsafe.Slice(coordMessages[i], messageSizes[i])
+	if p.coordPresent {
+		go func() {
+			for {
+				messageCount := p.ucxClient.GetCoordMessageCount()
+				if messageCount > 0 {
+					messageSizes := unsafe.Slice(p.ucxClient.GetCoordMessageSizes(messageCount), messageCount)
+					coordMessages := unsafe.Slice(p.ucxClient.GetCoordMessages(messageCount), messageCount)
+					for i := 0; i < messageCount; i++ {
+						messageSlice := unsafe.Slice(coordMessages[i], messageSizes[i])
 
-					msg := &pb.PeerMessage{}
-					err := proto.Unmarshal(messageSlice, msg)
-					if err != nil {
-						fmt.Printf("Error marshalling coord message: %s\n", err)
-					} else {
-						p.chCoordInData <- msg
+						msg := &pb.PeerMessage{}
+						err := proto.Unmarshal(messageSlice, msg)
+						if err != nil {
+							fmt.Printf("Error marshalling coord message: %s\n", err)
+						} else {
+							p.chCoordInData <- msg
+							p.cntMessageReceived[msg.FromNodeId]++
+						}
 					}
+				} else if messageCount == -1 {
+					break
+				} else {
+					time.Sleep(time.Millisecond * 1)
 				}
 			}
-		}
-	}()
+		}()
+	}
 }
 
 // receiveOnConn is an infinite loop in which a valid protobuf is attempted to be read from the TCP connection. It is unmarshalled and passed to the channel. No further validation of the message contents takes place here.
@@ -484,6 +519,15 @@ func (p *Node) receiveOnConn(conn net.Conn, ch chan *pb.PeerMessage) {
 			p.deadClients++
 			if p.deadClients == p.clientCount {
 				//pprof.StopCPUProfile()
+				totalMessageReceived := 0
+				totalMessageSent := 0
+				for i := 0; i < p.nodeCount; i++ {
+					totalMessageReceived += p.cntMessageReceived[i]
+					totalMessageSent += p.cntMessageSent[i]
+				}
+				fmt.Println("Messages received/s: ", totalMessageReceived/10)
+				fmt.Println("Messages sent/s: ", totalMessageSent/10)
+				fmt.Println(p.byteSent)
 				os.Exit(0)
 			}
 			break
@@ -511,6 +555,7 @@ func (p *Node) receiveOnConn(conn net.Conn, ch chan *pb.PeerMessage) {
 				} else {
 					//if p.VerifySig(msg) == true {
 					ch <- msg
+					p.cntMessageReceived[msg.FromNodeId]++
 					//fmt.Println("TIMEReceive ", time.Since(s))
 					//s = time.Now()
 					//}
@@ -908,6 +953,7 @@ func (p *Node) peerDecisionStep(chPeerIn chan *pb.PeerMessage, chClientIn chan *
 			if p.cntPrepare[msg.MsgId%CIRCULAR_BUFFER_SIZE] == p.peerCount {
 
 				if bytes.Compare(msg.AttachedData, p.clientMsgDigests[msg.MsgId%LOG_SIZE][:]) != 0 {
+					fmt.Println("Got Prepare with ID ", msg.MsgId, " and checked clientMsgDigests[", msg.MsgId%LOG_SIZE, "]")
 					fmt.Println("ERROR in message digest! Expected \n", msg.AttachedData, "\nand got \n", p.clientMsgDigests[msg.MsgId%LOG_SIZE][:])
 				} else {
 
@@ -938,6 +984,7 @@ func (p *Node) peerDecisionStep(chPeerIn chan *pb.PeerMessage, chClientIn chan *
 		} else if msg.Type == pb.MsgType_Commit && p.myEpoch == int(msg.EpochId) && p.wedged == false {
 
 			if bytes.Compare(msg.AttachedData, p.clientMsgDigests[msg.MsgId%LOG_SIZE][:]) != 0 {
+				fmt.Println("Got Commit with ID ", msg.MsgId, " and checked clientMsgDigests[", msg.MsgId%LOG_SIZE, "]")
 				fmt.Println("ERROR in message digest!")
 			} else {
 
@@ -1382,11 +1429,14 @@ func (p *Node) peerParallelSenderStep(chIn chan *MessageWrapper) {
 
 	for x := 0; x < MAX_SIG_CREATE; x++ {
 
-		go func(chIn <-chan *MessageWrapper, chOut chan<- *MessageWrapper) { //, srv *sha256.Avx512Server) {
+		go func(chIn <-chan *MessageWrapper, chOut chan<- *MessageWrapper, index int) { //, srv *sha256.Avx512Server) {
 
 			for {
 				wrap := <-chIn
-				//s := time.Now()
+				// s := time.Now()
+				// if p.myID == 0 {
+				// 	s = time.Now()
+				// }
 
 				msg := wrap.msg
 
@@ -1396,53 +1446,97 @@ func (p *Node) peerParallelSenderStep(chIn chan *MessageWrapper) {
 				}
 
 				chOut <- wrap
-				//fmt.Println("TIMESign ", time.Since(s))
+				// if p.myID == 0 {
+				// 	fmt.Println("TIMEHash ", time.Since(s))
+				// }
 
 			}
-		}(hashInQueues[x], hashOutQueues[x]) //, server[x])
+		}(hashInQueues[x], hashOutQueues[x], x) //, server[x])
 
 		//server[x] = sha256.NewAvx512Server()
 
-		go func(chIn <-chan *MessageWrapper, chOut chan<- *MessageWrapper) { //, srv *sha256.Avx512Server) {
+		go func(chIn <-chan *MessageWrapper, chOut chan<- *MessageWrapper, index int) { //, srv *sha256.Avx512Server) {
+			if p.offload {
+				wrap := &MessageWrapper{}
 
-			for {
-				wrap := <-chIn
-				//s := time.Now()
+				for {
+					wrap = <-chIn
 
-				msg := wrap.msg
+					nodeIds := make([]int32, 0)
+					for _, elem := range wrap.sendTo {
+						if elem != p.myID {
+							nodeIds = append(nodeIds, int32(elem))
+						}
+					}
 
-				hash := wrap.hash
+					signs := make([]*pb.Authenticator, 0)
 
-				////s := time.Now()
-				auth := &pb.Authenticator{}
-				if p.nodeRole[wrap.sendTo[0]] == ROLE_CLIENT && p.usePKToClient == true {
-					auth = p.CreateSigForHash(hash, pb.SigType_PKSig, wrap.sendTo[0])
-				} else {
-					auth = p.CreateSigForHash(hash, pb.SigType_MAC, wrap.sendTo[0])
+					if !p.offloadOutgoingSign {
+						signs = make([]*pb.Authenticator, len(nodeIds)*2)
+
+						hash := wrap.hash
+						for index, elem := range nodeIds {
+
+							//s := time.Now()
+							auth := &pb.Authenticator{}
+							if p.nodeRole[int(elem)] == ROLE_CLIENT && p.usePKToClient == true {
+								auth = p.CreateSigForHash(hash, pb.SigType_PKSig, int(elem))
+							} else {
+								auth = p.CreateSigForHash(hash, pb.SigType_MAC, int(elem))
+							}
+
+							//extra sig for the coordinator
+							authCoord := &pb.Authenticator{}
+							if p.coordPresent {
+								authCoord = p.CreateSigForHash(hash, pb.SigType_MAC, p.coordId)
+							}
+
+							signs[index*2] = auth
+							signs[index*2+1] = authCoord
+							//fmt.Println("OutSign ", time.Since(s))
+						}
+					}
+
+					//s := time.Now()
+					wrap.msg.Auth = nil
+					wrap.signs = signs
+
+					chOut <- wrap
+					//fmt.Println("TIMESign ", time.Since(s))
 				}
+			} else {
+				for {
+					wrap := <-chIn
+					msg := wrap.msg
+					hash := wrap.hash
 
-				//extra sig for the coordinator
-				authCoord := &pb.Authenticator{}
-				if p.coordPresent {
-					authCoord = p.CreateSigForHash(hash, pb.SigType_MAC, p.coordId)
+					// s := time.Now()
+					auth := &pb.Authenticator{}
+					if p.nodeRole[wrap.sendTo[0]] == ROLE_CLIENT && p.usePKToClient == true {
+						auth = p.CreateSigForHash(hash, pb.SigType_PKSig, wrap.sendTo[0])
+					} else {
+						auth = p.CreateSigForHash(hash, pb.SigType_MAC, wrap.sendTo[0])
+					}
+
+					//extra sig for the coordinator
+					authCoord := &pb.Authenticator{}
+					if p.coordPresent {
+						authCoord = p.CreateSigForHash(hash, pb.SigType_MAC, p.coordId)
+					}
+
+					// fmt.Println("OutSign ", time.Since(s))
+					// s = time.Now()
+
+					msg.Auth = make([]*pb.Authenticator, 2)
+					msg.Auth[0] = auth
+					msg.Auth[1] = authCoord
+
+					chOut <- wrap
+					// fmt.Println("TIMESign ", time.Since(s))
+
 				}
-
-				//fmt.Println("OutSign ", time.Since(s))
-				////s = time.Now()
-
-				msg.Auth = make([]*pb.Authenticator, 2)
-				msg.Auth[0] = auth
-				msg.Auth[1] = authCoord
-
-				dest := make([]int, 1)
-				dest[0] = wrap.sendTo[0]
-				newWrap := &MessageWrapper{msg: msg, sendTo: dest}
-
-				chOut <- newWrap
-				//fmt.Println("TIMESign ", time.Since(s))
-
 			}
-		}(signQueues[x], sendQueues[x]) //, server[x])
+		}(signQueues[x], sendQueues[x], x) //, server[x])
 
 	}
 
@@ -1454,6 +1548,7 @@ func (p *Node) peerParallelSenderStep(chIn chan *MessageWrapper) {
 			clone := &MessageWrapper{}
 			nextMsg := &MessageWrapper{}
 			nextMsg = nil
+			// s1 := time.Now()
 
 			for {
 
@@ -1461,10 +1556,12 @@ func (p *Node) peerParallelSenderStep(chIn chan *MessageWrapper) {
 					clone = nextMsg
 					nextMsg = nil
 				} else {
+					// s1 = time.Now()
 					clone = <-inChan
 				}
-
+				// s := time.Now()
 				raw, err := proto.Marshal(clone.msg)
+				// fmt.Println("TIMEMarshal ", time.Since(s))
 				if err != nil {
 					fmt.Printf("%s\n", err)
 				} else {
@@ -1482,9 +1579,14 @@ func (p *Node) peerParallelSenderStep(chIn chan *MessageWrapper) {
 						}
 					default:
 						nextMsg = nil
+						if pendingBytes == 0 {
+							continue
+						}
 					}
 
 					n, err := p.nodeConn[cid].Write(sendBuf)
+					// fmt.Println("TIMEMessage ", time.Since(s1))
+					p.cntMessageSent[cid]++
 					sendBuf = make([]byte, 0)
 					pendingBytes = 0
 
@@ -1492,6 +1594,7 @@ func (p *Node) peerParallelSenderStep(chIn chan *MessageWrapper) {
 						fmt.Printf("%s\n", err)
 					}
 					//fmt.Printf(" Sent %d bytes to %d, seq %d\n", n, cid, clone.msg.MsgId)
+					p.byteSent += uint64(n)
 					if n == 0 {
 						fmt.Printf(" Sent %d bytes\n", n)
 					}
@@ -1508,7 +1611,6 @@ func (p *Node) peerParallelSenderStep(chIn chan *MessageWrapper) {
 			wrap := <-chIn
 			hashInQueues[hashCnt%MAX_SIG_CREATE] <- wrap
 			hashCnt++
-
 		}
 	}()
 
@@ -1516,108 +1618,13 @@ func (p *Node) peerParallelSenderStep(chIn chan *MessageWrapper) {
 		sendCnt := 0
 		hashCnt := 0
 		for {
+			wrap := <-hashOutQueues[hashCnt%MAX_SIG_CREATE]
+			hashCnt++
+
 			if p.offload {
-				sendBuf := make([]byte, 0)
-				pendingBytes := 0
-				wrap := &MessageWrapper{}
-				nextMsg := &MessageWrapper{}
-				nextMsg = nil
-
-				for {
-
-					if nextMsg != nil {
-						wrap = nextMsg
-						nextMsg = nil
-					} else {
-						wrap = <-hashOutQueues[hashCnt%MAX_SIG_CREATE]
-						hashCnt++
-					}
-
-					nodeIds := make([]int32, 0)
-					for _, elem := range wrap.sendTo {
-						nodeIds = append(nodeIds, int32(elem))
-					}
-
-					signs := make([]*pb.Authenticator, 0)
-
-					if !p.offloadOutgoingSign {
-						signs = make([]*pb.Authenticator, len(nodeIds)*2)
-
-						var wg sync.WaitGroup
-						wg.Add(len(nodeIds))
-
-						for index, elem := range nodeIds {
-							go func(index int, elem int32) {
-								hash := wrap.hash
-
-								////s := time.Now()
-								auth := &pb.Authenticator{}
-								if p.nodeRole[int(elem)] == ROLE_CLIENT && p.usePKToClient == true {
-									auth = p.CreateSigForHash(hash, pb.SigType_PKSig, int(elem))
-								} else {
-									auth = p.CreateSigForHash(hash, pb.SigType_MAC, int(elem))
-								}
-
-								//extra sig for the coordinator
-								authCoord := &pb.Authenticator{}
-								if p.coordPresent {
-									authCoord = p.CreateSigForHash(hash, pb.SigType_MAC, p.coordId)
-								}
-
-								//fmt.Println("OutSign ", time.Since(s))
-								////s = time.Now()
-								signs[index*2] = auth
-								signs[index*2+1] = authCoord
-
-								wg.Done()
-							}(index, elem)
-						}
-
-						wg.Wait()
-					}
-
-					wrap.msg.Auth = nil
-
-					sendMsg := &pb.SendMessage{
-						NodeId:  nodeIds,
-						Message: wrap.msg,
-						Hash:    wrap.hash[:],
-						Signs:   signs,
-					}
-
-					rawMsg, err := proto.Marshal(sendMsg)
-					if err != nil {
-						fmt.Printf("%s\n", err)
-					}
-
-					lba := make([]byte, 4)
-					binary.LittleEndian.PutUint32(lba, uint32(len(rawMsg)))
-
-					sendBuf = append(sendBuf, lba...)
-					sendBuf = append(sendBuf, rawMsg...)
-					pendingBytes += len(lba) + len(rawMsg)
-
-					select {
-					case nextMsg = <-hashOutQueues[hashCnt%MAX_SIG_CREATE]:
-						hashCnt++
-						// will do an other pass
-						if pendingBytes < 64000 {
-							continue
-						}
-					default:
-						nextMsg = nil
-					}
-
-					p.ucxClient.Send(string(sendBuf[:]), 2)
-
-					sendBuf = make([]byte, 0)
-					pendingBytes = 0
-					sendCnt++
-				}
+				signQueues[sendCnt%MAX_SIG_CREATE] <- wrap
+				sendCnt++
 			} else {
-				wrap := <-hashOutQueues[hashCnt%MAX_SIG_CREATE]
-				hashCnt++
-
 				for _, elem := range wrap.sendTo {
 
 					newWrap := &MessageWrapper{}
@@ -1633,15 +1640,100 @@ func (p *Node) peerParallelSenderStep(chIn chan *MessageWrapper) {
 	}()
 
 	qCnt := 0
+	nextMsg := &MessageWrapper{}
+	nextMsg = nil
+	pendingBytes := 0
+	wrap := &MessageWrapper{}
+	sendBuf := make([]byte, 0)
+	// s1 := time.Now()
+
 	for {
-		clone := <-sendQueues[qCnt%MAX_SIG_CREATE]
-		//s := time.Now()
-		qCnt++
+		if p.offload {
 
-		peerQueues[clone.sendTo[0]] <- clone
+			if nextMsg != nil {
+				wrap = nextMsg
+			} else {
+				wrap = <-sendQueues[qCnt%MAX_SIG_CREATE]
+				// s1 = time.Now()
+				qCnt++
+			}
 
-		//fmt.Println("TIMESend ", time.Since(s))
+			nodeIds := make([]int32, 0)
+			for _, elem := range wrap.sendTo {
+				if elem == p.myID {
+					sameNodeMsg := p.clonePeerMessageNoAuth(wrap.msg)
+					sameNodeMsg.Auth = append(sameNodeMsg.Auth, &pb.Authenticator{})
+					sameNodeMsg.Auth = append(sameNodeMsg.Auth, &pb.Authenticator{})
+					p.chClientInData <- sameNodeMsg
+				} else {
+					nodeIds = append(nodeIds, int32(elem))
+				}
+			}
 
+			rawMsg, err := proto.Marshal(wrap.msg)
+			if err != nil {
+				fmt.Printf("%s\n", err)
+			}
+
+			rawSigns := make([][]byte, len(wrap.signs))
+			for index, elem := range wrap.signs {
+				rawSign, err := proto.Marshal(elem)
+				if err != nil {
+					fmt.Printf("%s\n", err)
+				}
+				rawSigns[index] = rawSign
+			}
+
+			sendMsg := &pb.SendMessage{
+				NodeId:  nodeIds,
+				Message: rawMsg,
+				Hash:    wrap.hash[:],
+				Signs:   rawSigns,
+			}
+
+			// s := time.Now()
+			rawSendMsg, err := proto.Marshal(sendMsg)
+			if err != nil {
+				fmt.Printf("%s\n", err)
+			}
+			// fmt.Println("TIMEMarshal ", time.Since(s))
+
+			lba := make([]byte, 4)
+			binary.LittleEndian.PutUint32(lba, uint32(len(rawSendMsg)))
+
+			sendBuf = append(sendBuf, lba...)
+			sendBuf = append(sendBuf, rawSendMsg...)
+			pendingBytes += len(lba) + len(rawSendMsg)
+
+			select {
+			case nextMsg = <-sendQueues[qCnt%MAX_SIG_CREATE]:
+				qCnt++
+				// will do an other pass
+				if pendingBytes < 64000 {
+					continue
+				}
+			default:
+				nextMsg = nil
+			}
+
+			p.ucxClient.Send(string(sendBuf[:]), 2)
+			p.cntMessageSent[0]++
+
+			// fmt.Println("TIMEMessage ", time.Since(s1))
+
+			sendBuf = make([]byte, 0)
+			pendingBytes = 0
+
+			//fmt.Println("TIMESend ", time.Since(s))
+		} else {
+			clone := <-sendQueues[qCnt%MAX_SIG_CREATE]
+			//s := time.Now()
+			qCnt++
+
+			peerQueues[clone.sendTo[0]] <- clone
+
+			//fmt.Println("TIMESend ", time.Since(s))
+		}
 	}
 }
 

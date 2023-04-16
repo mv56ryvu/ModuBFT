@@ -46,7 +46,6 @@ public:
 
     void cleanup();
 private:
-    static ucs_status_t request_progress(void* request, test_req_t* req);
     static void err_cb(void *arg, ucp_ep_h ep, ucs_status_t status);
     static void conn_handle_cb(ucp_conn_request_h conn_request, void *arg);
 };
