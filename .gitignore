@@ -1,0 +1,4 @@
+.vscode/settings.json
+src/.vscode/settings.json
+src/github.com/zistvan/cli-time
+src/github.com/zistvan/proto/peer.pb.go
