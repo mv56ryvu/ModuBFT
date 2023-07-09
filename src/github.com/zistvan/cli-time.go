@@ -23,10 +23,11 @@ func main() {
 	3 - list of base ports of nodes, seprarated by comma. The list is the same for all. The location in the list == nodeID
 	4 - role of each node, separeted by comma. ROLE constants defined in Node.
 	5 - wether the node should offload functionality to a connected dpu
-	5 - length of client requests in Bytes. This is only needed when starting a client
-	6 - optional batch factor (64)
-	7 - optional runtime (default 10s)
-	8 - optional print tput reading live (default 0)
+	6 - length of client requests in Bytes. This is only needed when starting a client
+	7 - optional address of DPU connected to the leader node, if present
+	8 - optional batch factor (64)
+	9 - optional runtime (default 10s)
+	10 - optional print tput reading live (default 0)
 	*/
 
 	myId, _ := strconv.Atoi(os.Args[1])
@@ -39,20 +40,25 @@ func main() {
 		nodeRole[ind], _ = strconv.Atoi(elem)
 	}
 
+	dpuAddress := ""
 	batchF := 64
 	runTime := 10
 	showLiveTput := 0
 
 	if len(os.Args) > 7 {
-		batchF, _ = strconv.Atoi(os.Args[7])
+		dpuAddress = os.Args[7]
 	}
 
 	if len(os.Args) > 8 {
-		runTime, _ = strconv.Atoi(os.Args[8])
+		batchF, _ = strconv.Atoi(os.Args[8])
 	}
 
 	if len(os.Args) > 9 {
-		showLiveTput, _ = strconv.Atoi(os.Args[9])
+		runTime, _ = strconv.Atoi(os.Args[9])
+	}
+
+	if len(os.Args) > 10 {
+		showLiveTput, _ = strconv.Atoi(os.Args[10])
 	}
 
 	portListNumbers := make([]int, len(portList))
@@ -67,7 +73,7 @@ func main() {
 
 	me := &n.Node{}
 
-	me.Initialize(myId, nodeList, portListNumbers, nodeRole, offload)
+	me.Initialize(myId, nodeList, portListNumbers, nodeRole, offload, dpuAddress)
 	me.Run()
 
 	// if the node is to be a client...
@@ -175,6 +181,8 @@ func main() {
 		}
 
 		elapsed = time.Since(start)
+		fmt.Println(realReceived)
+		fmt.Println(float32(elapsed) / 1000000000.0)
 		tput := float32(realReceived) / (float32(elapsed) / 1000000000.0)
 		fmt.Printf("\nThroughput [ops/s] %d\n", int(tput))
 		os.Exit(0)
